@@ -1,4 +1,4 @@
-// PNG squeeze v1 — lossless PNG recompressor for 1280x720 RGBA screenshots.
+// PNG squeeze v2 — lossless PNG recompressor for 1280x720 RGBA screenshots.
 //
 // Strategy (written from scratch for this competition):
 //   1. Decode the stored RGBA input PNG.
@@ -7,12 +7,15 @@
 //   3. Try every exact form the image can take (palette by count / by luminance,
 //      grey, grey+alpha, RGB, RGBA, with tRNS key where legal) and, for each,
 //      several per-row filter strategies (fixed 0/1/2/3/4, minimum-sum, fewest
-//      distinct byte pairs, and brute force: each row's filter picked by the
-//      real deflate size of that row after the previous 32 KiB).
-//   4. Screen every candidate with zlib level 6, keep the smallest, then
-//      recompress the winner at level 9 (memLevel 9, default and filtered
-//      strategies) and keep the smallest stream.
-//   5. Write only IHDR / PLTE / tRNS / IDAT / IEND, bit depth 8, no interlace.
+//      distinct byte pairs). The per-row brute-force filter is kept: it wins
+//      the level-6 screen on the rich images, and the optimal parser below
+//      compounds its advantage.
+//   4. Screen every candidate with zlib level 6 and keep the smallest.
+//   5. Compress the winner's filtered stream with the custom optimal-parsing
+//      DEFLATE in ./deflate-opt.mjs (hash-chained match search, dynamic
+//      programming over per-length best distances, length-limited Huffman
+//      codes), against one zlib level-9 fallback; keep the smaller stream.
+//   6. Write only IHDR / PLTE / tRNS / IDAT / IEND, bit depth 8, no interlace.
 //
 // Fully deterministic: fixed work per image, no clock, no environment, no
 // files outside /input /output /tmp. One wall budget is shared by all 8
@@ -20,6 +23,7 @@
 import { deflateSync, inflateSync, constants } from 'node:zlib';
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { deflateOptimal } from './deflate-opt.mjs';
 
 // ---------------------------------------------------------------- PNG codec
 const SIG = Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10);
@@ -399,9 +403,10 @@ function pngOfForm(width, height, form, idat) {
   return pngOf(chunks);
 }
 
-// Compress one image: screen every form/filter at level 6, take the three
-// best, recompress each at level 9 (memLevel 9, default / filtered / RLE
-// strategies, memLevel 8 too), return the smallest PNG.
+// Compress one image: screen every form/filter at level 6, take the best,
+// compress its filtered stream with the optimal parser (one greedy pass +
+// one DP pass, hash chains 512 / 512) against one zlib level-9 fallback,
+// and return the smallest PNG.
 function compressImage(rgba, width, height) {
   const cands = [];
   for (const form of formsOf(rgba)) {
@@ -413,22 +418,17 @@ function compressImage(rgba, width, height) {
     }
   }
   cands.sort((a, b) => a.bytes - b.bytes);
-  const FINAL = [
-    { level: 9, memLevel: 9, strategy: constants.Z_DEFAULT_STRATEGY },
-    { level: 9, memLevel: 9, strategy: constants.Z_FILTERED },
-    { level: 9, memLevel: 9, strategy: constants.Z_RLE },
-    { level: 9, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY },
-  ];
-  let best = null;
-  for (const cand of cands.slice(0, 3)) {
-    const chunks = chunkBytes(cand.form);
-    for (const opts of FINAL) {
-      const z = deflateSync(cand.data, opts);
-      const bytes = z.length + chunks;
-      if (best === null || bytes < best.bytes) best = { form: cand.form, idat: z, bytes };
-    }
-  }
-  return pngOfForm(width, height, best.form, best.idat);
+  const best = cands[0];
+  // The optimal parser's cost is linear in the stream size, and the deep
+  // chain pays off most on the small, highly compressible streams (palette
+  // / grey forms, ~1 byte per pixel); the large multi-byte-per-pixel
+  // streams gain almost nothing past a 384 chain, so they take the shorter
+  // one to keep the whole set inside the 60s wall.
+  const dpChain = best.data.length <= 1000000 ? 512 : 384;
+  const opt = deflateOptimal(best.data, 1, 512, dpChain);
+  const z9 = deflateSync(best.data, { level: 9, memLevel: 9, strategy: constants.Z_DEFAULT_STRATEGY });
+  const idat = opt !== null && opt.length <= z9.length ? opt : z9;
+  return pngOfForm(width, height, best.form, idat);
 }
 
 // ---------------------------------------------------------------- main
